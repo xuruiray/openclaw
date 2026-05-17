@@ -1,10 +1,21 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ChannelPlugin } from "../channels/plugins/types.js";
 import type { ConfigWriteNotification } from "../config/config.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
+import { createEmptyRuntimeWebToolsMetadata } from "../secrets/runtime-fast-path.js";
+import {
+  activateSecretsRuntimeSnapshotState,
+  clearSecretsRuntimeSnapshot,
+  getActiveSecretsRuntimeSnapshot,
+  type PreparedSecretsRuntimeSnapshot,
+} from "../secrets/runtime-state.js";
+import { createTestRegistry } from "../test-utils/channel-plugins.js";
 import type { ChannelKind, GatewayReloadPlan } from "./config-reload-plan.js";
 import type { GatewayPluginReloadResult } from "./server-reload-handlers.js";
 import {
   createGatewayReloadHandlers,
+  GatewayChannelReloadError,
   startManagedGatewayConfigReloader,
 } from "./server-reload-handlers.js";
 
@@ -139,7 +150,38 @@ afterEach(() => {
   hoisted.activeEmbeddedRunSessionKeys.length = 0;
   hoisted.markRestartAbortedMainSessions.mockClear();
   hoisted.runtimeConfig.value = { session: { store: "/tmp/active-sessions.json" } };
+  clearSecretsRuntimeSnapshot();
+  resetPluginRuntimeStateForTest();
 });
+
+function createHotReloadPlan(
+  overrides: Partial<GatewayReloadPlan> & Pick<GatewayReloadPlan, "changedPaths" | "hotReasons">,
+): GatewayReloadPlan {
+  return {
+    restartGateway: false,
+    restartReasons: [],
+    reloadHooks: false,
+    restartGmailWatcher: false,
+    restartCron: false,
+    restartHeartbeat: false,
+    restartHealthMonitor: false,
+    reloadPlugins: false,
+    restartChannels: new Set(),
+    disposeMcpRuntimes: false,
+    noopPaths: [],
+    ...overrides,
+  };
+}
+
+function createPreparedSnapshot(config: OpenClawConfig): PreparedSecretsRuntimeSnapshot {
+  return {
+    sourceConfig: config,
+    config,
+    authStores: [],
+    warnings: [],
+    webTools: createEmptyRuntimeWebToolsMetadata(),
+  };
+}
 
 describe("gateway restart deferral preflight", () => {
   it("logs active task run ids before waiting and when forcing after timeout", async () => {
@@ -223,6 +265,545 @@ describe("gateway restart deferral preflight", () => {
       process.removeListener("SIGUSR1", signalSpy);
       restartTesting.resetSigusr1State();
     }
+  });
+});
+
+describe("gateway channel hot reload handlers", () => {
+  it("continues restarting later channels after one channel stop fails", async () => {
+    const previousSkipChannels = process.env.OPENCLAW_SKIP_CHANNELS;
+    const previousSkipProviders = process.env.OPENCLAW_SKIP_PROVIDERS;
+    delete process.env.OPENCLAW_SKIP_CHANNELS;
+    delete process.env.OPENCLAW_SKIP_PROVIDERS;
+    const cron = { start: vi.fn(async () => {}), stop: vi.fn() };
+    const heartbeatRunner = {
+      stop: vi.fn(),
+      updateConfig: vi.fn(),
+    };
+    const setState = vi.fn();
+    const startChannel = vi.fn(async () => {});
+    const stopChannel = vi.fn(async (channel: ChannelKind) => {
+      if (channel === "telegram") {
+        throw new Error("telegram stop failed");
+      }
+    });
+    const logChannels = { info: vi.fn(), error: vi.fn() };
+    const logReload = { info: vi.fn(), warn: vi.fn() };
+    const { applyHotReload } = createGatewayReloadHandlers({
+      deps: {} as never,
+      broadcast: vi.fn(),
+      getState: () => ({
+        hooksConfig: {} as never,
+        hookClientIpConfig: {} as never,
+        heartbeatRunner: heartbeatRunner as never,
+        cronState: { cron, storePath: "/tmp/cron.json", cronEnabled: false } as never,
+        channelHealthMonitor: null,
+      }),
+      setState,
+      startChannel,
+      stopChannel,
+      stopPostReadySidecars: vi.fn(),
+      reloadPlugins: vi.fn(
+        async (): Promise<GatewayPluginReloadResult> => ({
+          restartChannels: new Set(),
+          activeChannels: new Set(),
+        }),
+      ),
+      logHooks: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      logChannels,
+      logCron: { error: vi.fn() },
+      logReload,
+      createHealthMonitor: () => null,
+    });
+
+    try {
+      await expect(
+        applyHotReload(
+          createHotReloadPlan({
+            changedPaths: ["channels.telegram.botToken", "channels.discord.token"],
+            hotReasons: ["channels"],
+            restartChannels: new Set(["telegram", "discord", "signal"]),
+          }),
+          {},
+        ),
+      ).rejects.toMatchObject({
+        name: "GatewayChannelReloadError",
+        channels: ["telegram"],
+        restartedChannels: ["discord", "signal"],
+      });
+    } finally {
+      if (previousSkipChannels === undefined) {
+        delete process.env.OPENCLAW_SKIP_CHANNELS;
+      } else {
+        process.env.OPENCLAW_SKIP_CHANNELS = previousSkipChannels;
+      }
+      if (previousSkipProviders === undefined) {
+        delete process.env.OPENCLAW_SKIP_PROVIDERS;
+      } else {
+        process.env.OPENCLAW_SKIP_PROVIDERS = previousSkipProviders;
+      }
+    }
+
+    expect(stopChannel).toHaveBeenCalledWith("telegram");
+    expect(stopChannel).toHaveBeenCalledWith("discord");
+    expect(stopChannel).toHaveBeenCalledWith("signal");
+    expect(startChannel).not.toHaveBeenCalledWith("telegram");
+    expect(startChannel).toHaveBeenCalledWith("discord");
+    expect(startChannel).toHaveBeenCalledWith("signal");
+    expect(logChannels.error).toHaveBeenCalledWith(
+      "failed to restart telegram channel during config reload: Error: telegram stop failed",
+    );
+    expect(logReload.warn).toHaveBeenCalledWith(
+      "config hot reload completed with channel restart failures: telegram",
+    );
+    expect(setState).toHaveBeenCalledTimes(1);
+  });
+
+  it("continues restarting later channels after one channel start fails", async () => {
+    const previousSkipChannels = process.env.OPENCLAW_SKIP_CHANNELS;
+    const previousSkipProviders = process.env.OPENCLAW_SKIP_PROVIDERS;
+    delete process.env.OPENCLAW_SKIP_CHANNELS;
+    delete process.env.OPENCLAW_SKIP_PROVIDERS;
+    const cron = { start: vi.fn(async () => {}), stop: vi.fn() };
+    const heartbeatRunner = {
+      stop: vi.fn(),
+      updateConfig: vi.fn(),
+    };
+    const setState = vi.fn();
+    const stopChannel = vi.fn(async () => {});
+    const startChannel = vi.fn(async (channel: ChannelKind) => {
+      if (channel === "discord") {
+        throw new Error("discord start failed");
+      }
+    });
+    const logReload = { info: vi.fn(), warn: vi.fn() };
+    const { applyHotReload } = createGatewayReloadHandlers({
+      deps: {} as never,
+      broadcast: vi.fn(),
+      getState: () => ({
+        hooksConfig: {} as never,
+        hookClientIpConfig: {} as never,
+        heartbeatRunner: heartbeatRunner as never,
+        cronState: { cron, storePath: "/tmp/cron.json", cronEnabled: false } as never,
+        channelHealthMonitor: null,
+      }),
+      setState,
+      startChannel,
+      stopChannel,
+      stopPostReadySidecars: vi.fn(),
+      reloadPlugins: vi.fn(
+        async (): Promise<GatewayPluginReloadResult> => ({
+          restartChannels: new Set(),
+          activeChannels: new Set(),
+        }),
+      ),
+      logHooks: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      logChannels: { info: vi.fn(), error: vi.fn() },
+      logCron: { error: vi.fn() },
+      logReload,
+      createHealthMonitor: () => null,
+    });
+
+    try {
+      await expect(
+        applyHotReload(
+          createHotReloadPlan({
+            changedPaths: ["channels.discord.token"],
+            hotReasons: ["channels"],
+            restartChannels: new Set(["telegram", "discord", "signal"]),
+          }),
+          {},
+        ),
+      ).rejects.toMatchObject({
+        name: "GatewayChannelReloadError",
+        channels: ["discord"],
+        restartedChannels: ["telegram", "signal"],
+      });
+    } finally {
+      if (previousSkipChannels === undefined) {
+        delete process.env.OPENCLAW_SKIP_CHANNELS;
+      } else {
+        process.env.OPENCLAW_SKIP_CHANNELS = previousSkipChannels;
+      }
+      if (previousSkipProviders === undefined) {
+        delete process.env.OPENCLAW_SKIP_PROVIDERS;
+      } else {
+        process.env.OPENCLAW_SKIP_PROVIDERS = previousSkipProviders;
+      }
+    }
+
+    expect(startChannel).toHaveBeenCalledWith("telegram");
+    expect(startChannel).toHaveBeenCalledWith("discord");
+    expect(startChannel).toHaveBeenCalledWith("signal");
+    expect(logReload.warn).toHaveBeenCalledWith(
+      "config hot reload completed with channel restart failures: discord",
+    );
+    expect(setState).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces partial channel reload failure without promoting it to last-known-good", async () => {
+    const previousSkipChannels = process.env.OPENCLAW_SKIP_CHANNELS;
+    const previousSkipProviders = process.env.OPENCLAW_SKIP_PROVIDERS;
+    delete process.env.OPENCLAW_SKIP_CHANNELS;
+    delete process.env.OPENCLAW_SKIP_PROVIDERS;
+    const initialConfig = {
+      gateway: { reload: { debounceMs: 0 } },
+      channels: { telegram: { botToken: "old-token" } },
+    } as OpenClawConfig;
+    const nextConfig = {
+      gateway: { reload: { debounceMs: 0 } },
+      channels: {
+        telegram: { botToken: "new-token" },
+        discord: { token: "new-discord-token" },
+      },
+    } as OpenClawConfig;
+    const channelPlugins: ChannelPlugin[] = [
+      {
+        id: "telegram",
+        meta: {
+          id: "telegram",
+          label: "Telegram",
+          selectionLabel: "Telegram",
+          docsPath: "/channels/telegram",
+          blurb: "test",
+        },
+        capabilities: { chatTypes: ["direct"] },
+        config: {
+          listAccountIds: () => [],
+          resolveAccount: () => ({}),
+        },
+        reload: { configPrefixes: ["channels.telegram"] },
+      },
+      {
+        id: "discord",
+        meta: {
+          id: "discord",
+          label: "Discord",
+          selectionLabel: "Discord",
+          docsPath: "/channels/discord",
+          blurb: "test",
+        },
+        capabilities: { chatTypes: ["direct"] },
+        config: {
+          listAccountIds: () => [],
+          resolveAccount: () => ({}),
+        },
+        reload: { configPrefixes: ["channels.discord"] },
+      },
+    ];
+    setActivePluginRegistry(
+      createTestRegistry(
+        channelPlugins.map((plugin) => ({ pluginId: plugin.id, plugin, source: "test" })),
+      ),
+    );
+    activateSecretsRuntimeSnapshotState({
+      snapshot: createPreparedSnapshot(initialConfig),
+      refreshContext: null,
+      refreshHandler: null,
+    });
+    const writeListenerRef: { current: ((event: ConfigWriteNotification) => void) | null } = {
+      current: null,
+    };
+    const logReload = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const sharedGatewaySessionGenerationState = { current: "old", required: null };
+    const setState = vi.fn();
+    const promoteSnapshot = vi.fn(async () => {});
+    const startChannel = vi.fn(async (channel: ChannelKind) => {
+      if (channel === "telegram") {
+        throw new Error("telegram start failed");
+      }
+    });
+    const reloader = startManagedGatewayConfigReloader({
+      minimalTestGateway: false,
+      initialConfig,
+      initialCompareConfig: initialConfig,
+      initialInternalWriteHash: null,
+      watchPath: "/tmp/openclaw.json",
+      readSnapshot: vi.fn(async () => ({
+        path: "/tmp/openclaw.json",
+        exists: true,
+        raw: "{}",
+        parsed: {},
+        sourceConfig: nextConfig,
+        resolved: nextConfig,
+        valid: true,
+        runtimeConfig: nextConfig,
+        config: nextConfig,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+        hash: "hash-next",
+      })) as never,
+      promoteSnapshot: promoteSnapshot as never,
+      subscribeToWrites: ((listener: (event: ConfigWriteNotification) => void) => {
+        writeListenerRef.current = listener;
+        return () => {
+          if (writeListenerRef.current === listener) {
+            writeListenerRef.current = null;
+          }
+        };
+      }) as never,
+      deps: {} as never,
+      broadcast: vi.fn(),
+      getState: () => ({
+        hooksConfig: {} as never,
+        hookClientIpConfig: {} as never,
+        heartbeatRunner: { stop: vi.fn(), updateConfig: vi.fn() } as never,
+        cronState: {
+          cron: { start: vi.fn(async () => {}), stop: vi.fn() },
+          storePath: "/tmp/cron.json",
+          cronEnabled: false,
+        } as never,
+        channelHealthMonitor: null,
+      }),
+      setState,
+      startChannel,
+      stopChannel: vi.fn(async () => {}),
+      reloadPlugins: vi.fn(
+        async (): Promise<GatewayPluginReloadResult> => ({
+          restartChannels: new Set(),
+          activeChannels: new Set(),
+        }),
+      ),
+      logHooks: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      logChannels: { info: vi.fn(), error: vi.fn() },
+      logCron: { error: vi.fn() },
+      logReload,
+      channelManager: {} as never,
+      activateRuntimeSecrets: vi.fn(async (config: OpenClawConfig) => {
+        const snapshot = createPreparedSnapshot(config);
+        activateSecretsRuntimeSnapshotState({
+          snapshot,
+          refreshContext: null,
+          refreshHandler: null,
+        });
+        return snapshot;
+      }) as never,
+      resolveSharedGatewaySessionGenerationForConfig: (config) =>
+        config.channels?.discord ? "new" : "old",
+      sharedGatewaySessionGenerationState,
+      clients: [],
+    });
+    const registeredWriteListener = writeListenerRef.current;
+    if (!registeredWriteListener) {
+      throw new Error("Expected config write listener to be registered");
+    }
+
+    try {
+      registeredWriteListener({
+        configPath: "/tmp/openclaw.json",
+        sourceConfig: nextConfig,
+        runtimeConfig: nextConfig,
+        persistedHash: "hash-next",
+        revision: 1,
+        fingerprint: "runtime-hash-next",
+        sourceFingerprint: "source-hash-next",
+        writtenAtMs: Date.now(),
+      });
+
+      await vi.waitFor(() => {
+        expect(logReload.error).toHaveBeenCalledWith(
+          expect.stringContaining("config reload failed: GatewayChannelReloadError"),
+        );
+      });
+    } finally {
+      await reloader.stop();
+      if (previousSkipChannels === undefined) {
+        delete process.env.OPENCLAW_SKIP_CHANNELS;
+      } else {
+        process.env.OPENCLAW_SKIP_CHANNELS = previousSkipChannels;
+      }
+      if (previousSkipProviders === undefined) {
+        delete process.env.OPENCLAW_SKIP_PROVIDERS;
+      } else {
+        process.env.OPENCLAW_SKIP_PROVIDERS = previousSkipProviders;
+      }
+    }
+
+    expect(startChannel).toHaveBeenCalledWith("telegram");
+    expect(startChannel).toHaveBeenCalledWith("discord");
+    expect(setState).toHaveBeenCalledTimes(1);
+    expect(promoteSnapshot).not.toHaveBeenCalled();
+    expect(getActiveSecretsRuntimeSnapshot()?.sourceConfig).toEqual(nextConfig);
+    expect(sharedGatewaySessionGenerationState.current).toBe("new");
+  });
+
+  it("rolls back managed runtime secrets when no channel restart succeeds", async () => {
+    const previousSkipChannels = process.env.OPENCLAW_SKIP_CHANNELS;
+    const previousSkipProviders = process.env.OPENCLAW_SKIP_PROVIDERS;
+    delete process.env.OPENCLAW_SKIP_CHANNELS;
+    delete process.env.OPENCLAW_SKIP_PROVIDERS;
+    const initialConfig = {
+      gateway: { reload: { debounceMs: 0 } },
+      channels: { telegram: { botToken: "old-token" } },
+    } as OpenClawConfig;
+    const nextConfig = {
+      gateway: { reload: { debounceMs: 0 } },
+      channels: { telegram: { botToken: "new-token" } },
+    } as OpenClawConfig;
+    const channelPlugins: ChannelPlugin[] = [
+      {
+        id: "telegram",
+        meta: {
+          id: "telegram",
+          label: "Telegram",
+          selectionLabel: "Telegram",
+          docsPath: "/channels/telegram",
+          blurb: "test",
+        },
+        capabilities: { chatTypes: ["direct"] },
+        config: {
+          listAccountIds: () => [],
+          resolveAccount: () => ({}),
+        },
+        reload: { configPrefixes: ["channels.telegram"] },
+      },
+    ];
+    setActivePluginRegistry(
+      createTestRegistry(
+        channelPlugins.map((plugin) => ({ pluginId: plugin.id, plugin, source: "test" })),
+      ),
+    );
+    activateSecretsRuntimeSnapshotState({
+      snapshot: createPreparedSnapshot(initialConfig),
+      refreshContext: null,
+      refreshHandler: null,
+    });
+    const writeListenerRef: { current: ((event: ConfigWriteNotification) => void) | null } = {
+      current: null,
+    };
+    const logReload = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const sharedGatewaySessionGenerationState = { current: "old", required: null };
+    const setState = vi.fn();
+    const promoteSnapshot = vi.fn(async () => {});
+    const startChannel = vi.fn(async () => {
+      throw new Error("telegram start failed");
+    });
+    const reloader = startManagedGatewayConfigReloader({
+      minimalTestGateway: false,
+      initialConfig,
+      initialCompareConfig: initialConfig,
+      initialInternalWriteHash: null,
+      watchPath: "/tmp/openclaw.json",
+      readSnapshot: vi.fn(async () => ({
+        path: "/tmp/openclaw.json",
+        exists: true,
+        raw: "{}",
+        parsed: {},
+        sourceConfig: nextConfig,
+        resolved: nextConfig,
+        valid: true,
+        runtimeConfig: nextConfig,
+        config: nextConfig,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+        hash: "hash-next",
+      })) as never,
+      promoteSnapshot: promoteSnapshot as never,
+      subscribeToWrites: ((listener: (event: ConfigWriteNotification) => void) => {
+        writeListenerRef.current = listener;
+        return () => {
+          if (writeListenerRef.current === listener) {
+            writeListenerRef.current = null;
+          }
+        };
+      }) as never,
+      deps: {} as never,
+      broadcast: vi.fn(),
+      getState: () => ({
+        hooksConfig: {} as never,
+        hookClientIpConfig: {} as never,
+        heartbeatRunner: { stop: vi.fn(), updateConfig: vi.fn() } as never,
+        cronState: {
+          cron: { start: vi.fn(async () => {}), stop: vi.fn() },
+          storePath: "/tmp/cron.json",
+          cronEnabled: false,
+        } as never,
+        channelHealthMonitor: null,
+      }),
+      setState,
+      startChannel,
+      stopChannel: vi.fn(async () => {}),
+      reloadPlugins: vi.fn(
+        async (): Promise<GatewayPluginReloadResult> => ({
+          restartChannels: new Set(),
+          activeChannels: new Set(),
+        }),
+      ),
+      logHooks: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      logChannels: { info: vi.fn(), error: vi.fn() },
+      logCron: { error: vi.fn() },
+      logReload,
+      channelManager: {} as never,
+      activateRuntimeSecrets: vi.fn(async (config: OpenClawConfig) => {
+        const snapshot = createPreparedSnapshot(config);
+        activateSecretsRuntimeSnapshotState({
+          snapshot,
+          refreshContext: null,
+          refreshHandler: null,
+        });
+        return snapshot;
+      }) as never,
+      resolveSharedGatewaySessionGenerationForConfig: (config) =>
+        config.channels?.telegram?.botToken === "new-token" ? "new" : "old",
+      sharedGatewaySessionGenerationState,
+      clients: [],
+    });
+    const registeredWriteListener = writeListenerRef.current;
+    if (!registeredWriteListener) {
+      throw new Error("Expected config write listener to be registered");
+    }
+
+    try {
+      registeredWriteListener({
+        configPath: "/tmp/openclaw.json",
+        sourceConfig: nextConfig,
+        runtimeConfig: nextConfig,
+        persistedHash: "hash-next",
+        revision: 1,
+        fingerprint: "runtime-hash-next",
+        sourceFingerprint: "source-hash-next",
+        writtenAtMs: Date.now(),
+      });
+
+      await vi.waitFor(() => {
+        expect(logReload.error).toHaveBeenCalledWith(
+          expect.stringContaining("config reload failed: GatewayChannelReloadError"),
+        );
+      });
+    } finally {
+      await reloader.stop();
+      if (previousSkipChannels === undefined) {
+        delete process.env.OPENCLAW_SKIP_CHANNELS;
+      } else {
+        process.env.OPENCLAW_SKIP_CHANNELS = previousSkipChannels;
+      }
+      if (previousSkipProviders === undefined) {
+        delete process.env.OPENCLAW_SKIP_PROVIDERS;
+      } else {
+        process.env.OPENCLAW_SKIP_PROVIDERS = previousSkipProviders;
+      }
+    }
+
+    expect(startChannel).toHaveBeenCalledWith("telegram");
+    expect(setState).not.toHaveBeenCalled();
+    expect(promoteSnapshot).not.toHaveBeenCalled();
+    expect(getActiveSecretsRuntimeSnapshot()?.sourceConfig).toEqual(initialConfig);
+    expect(sharedGatewaySessionGenerationState.current).toBe("old");
+  });
+
+  it("exposes failed channel names on the reload error", async () => {
+    const error = new GatewayChannelReloadError(
+      [
+        { channel: "telegram", error: new Error("telegram failed") },
+        { channel: "discord", error: new Error("discord failed") },
+      ],
+      ["signal"],
+    );
+
+    expect(error.message).toBe("channel restart failed during config reload: telegram, discord");
+    expect(error.channels).toEqual(["telegram", "discord"]);
+    expect(error.restartedChannels).toEqual(["signal"]);
   });
 });
 

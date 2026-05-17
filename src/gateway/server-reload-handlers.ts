@@ -85,6 +85,33 @@ const MCP_RUNTIME_RELOAD_DISPOSE_TIMEOUT_MS = 5_000;
 const CHANNEL_RELOAD_DEFERRAL_POLL_MS = 500;
 const CHANNEL_RELOAD_STILL_PENDING_WARN_MS = 30_000;
 
+type GatewayChannelReloadFailure = {
+  channel: ChannelKind;
+  error: unknown;
+};
+
+export class GatewayChannelReloadError extends Error {
+  readonly failures: readonly GatewayChannelReloadFailure[];
+  readonly channels: readonly ChannelKind[];
+  readonly restartedChannels: readonly ChannelKind[];
+
+  constructor(
+    failures: readonly GatewayChannelReloadFailure[],
+    restartedChannels: readonly ChannelKind[] = [],
+  ) {
+    const channels = failures.map((failure) => failure.channel);
+    super(`channel restart failed during config reload: ${channels.join(", ")}`);
+    this.name = "GatewayChannelReloadError";
+    this.failures = failures.map((failure) => ({ ...failure }));
+    this.channels = channels;
+    this.restartedChannels = [...restartedChannels];
+  }
+}
+
+function isGatewayChannelReloadError(error: unknown): error is GatewayChannelReloadError {
+  return error instanceof GatewayChannelReloadError;
+}
+
 async function disposeMcpRuntimesWithTimeout(params: {
   dispose: () => Promise<void>;
   timeoutMs: number;
@@ -410,6 +437,7 @@ export function createGatewayReloadHandlers(params: GatewayReloadHandlerParams) 
       }
     }
 
+    let channelReloadError: GatewayChannelReloadError | null = null;
     if (channelsToRestart.size > 0) {
       if (shouldSkipChannelRestart()) {
         params.logChannels.info(
@@ -419,31 +447,58 @@ export function createGatewayReloadHandlers(params: GatewayReloadHandlerParams) 
         if (!plan.reloadPlugins) {
           await waitForActiveWorkBeforeChannelReload(channelsToRestart, nextConfig);
         }
-        const restartChannel = async (name: ChannelKind) => {
+        const restartFailures: GatewayChannelReloadFailure[] = [];
+        const restartedChannels: ChannelKind[] = [];
+        const restartChannel = async (name: ChannelKind): Promise<boolean> => {
           if (plan.reloadPlugins && activePluginChannelsAfterReload?.has(name) === false) {
-            return;
+            return false;
           }
           params.logChannels.info(`restarting ${name} channel`);
           if (!channelsStoppedBeforePluginReload.has(name)) {
             await params.stopChannel(name);
           }
           await params.startChannel(name);
+          return true;
         };
         for (const channel of channelsToRestart) {
-          await restartChannel(channel);
+          try {
+            if (await restartChannel(channel)) {
+              restartedChannels.push(channel);
+            }
+          } catch (err) {
+            params.logChannels.error(
+              `failed to restart ${channel} channel during config reload: ${String(err)}`,
+            );
+            restartFailures.push({ channel, error: err });
+          }
+        }
+        if (restartFailures.length > 0) {
+          channelReloadError = new GatewayChannelReloadError(restartFailures, restartedChannels);
+          params.logReload.warn(
+            `config hot reload completed with channel restart failures: ${channelReloadError.channels.join(
+              ", ",
+            )}`,
+          );
         }
       }
     }
 
+    if (channelReloadError && channelReloadError.restartedChannels.length === 0) {
+      throw channelReloadError;
+    }
+
     applyGatewayLaneConcurrency(nextConfig);
 
-    if (plan.hotReasons.length > 0) {
+    if (channelReloadError === null && plan.hotReasons.length > 0) {
       params.logReload.info(`config hot reload applied (${plan.hotReasons.join(", ")})`);
-    } else if (plan.noopPaths.length > 0) {
+    } else if (channelReloadError === null && plan.noopPaths.length > 0) {
       params.logReload.info(`config change applied (dynamic reads: ${plan.noopPaths.join(", ")})`);
     }
 
     params.setState(nextState);
+    if (channelReloadError) {
+      throw channelReloadError;
+    }
   };
 
   let restartPending = false;
@@ -611,6 +666,15 @@ export function startManagedGatewayConfigReloader(params: ManagedGatewayConfigRe
       try {
         await applyHotReload(plan, prepared.config);
       } catch (err) {
+        if (isGatewayChannelReloadError(err) && err.restartedChannels.length > 0) {
+          // Some channels may already be running with the prepared config; do
+          // not roll the shared runtime snapshot back after a partial restart.
+          setCurrentSharedGatewaySessionGeneration(
+            params.sharedGatewaySessionGenerationState,
+            nextSharedGatewaySessionGeneration,
+          );
+          throw err;
+        }
         if (previousSnapshot) {
           await activateSecretsRuntimeSnapshot(previousSnapshot);
         } else {

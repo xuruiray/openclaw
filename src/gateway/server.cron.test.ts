@@ -6,10 +6,16 @@ import path from "node:path";
 import { setImmediate as setImmediatePromise } from "node:timers/promises";
 import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 import type WebSocket from "ws";
+import type { ChannelPlugin } from "../channels/plugins/types.js";
 import { resetConfigRuntimeState } from "../config/config.js";
 import { loadCronStore, saveCronStore } from "../cron/store.js";
 import type { GuardedFetchOptions } from "../infra/net/fetch-guard.js";
 import { peekSystemEvents } from "../infra/system-events.js";
+import {
+  createChannelTestPluginBase,
+  createDirectOutboundTestAdapter,
+  createTestRegistry,
+} from "../test-utils/channel-plugins.js";
 import type { GatewayCronState } from "./server-cron.js";
 import {
   connectOk,
@@ -17,6 +23,7 @@ import {
   installGatewayTestHooks,
   onceMessage,
   rpcReq,
+  setTestPluginRegistry,
   startServerWithClient,
   testState,
 } from "./test-helpers.js";
@@ -285,7 +292,18 @@ async function directCronReq(
   return result;
 }
 
-function expectCronJobIdFromResponse(response: { ok?: unknown; payload?: unknown }) {
+function expectCronJobIdFromResponse(response: {
+  ok?: unknown;
+  payload?: unknown;
+  error?: { message?: unknown };
+}) {
+  if (response.ok !== true) {
+    const message =
+      typeof response.error?.message === "string"
+        ? response.error.message
+        : `unexpected cron response: ${JSON.stringify(response)}`;
+    throw new Error(message);
+  }
   expect(response.ok).toBe(true);
   const value = (response.payload as { id?: unknown } | null)?.id;
   const id = typeof value === "string" ? value : "";
@@ -339,6 +357,41 @@ async function writeCronConfig(config: unknown) {
   await fs.mkdir(path.dirname(configPath as string), { recursive: true });
   await fs.writeFile(configPath as string, JSON.stringify(config, null, 2), "utf-8");
   resetConfigRuntimeState();
+}
+
+type CronConfiguredChannelId = "feishu" | "signal" | "telegram";
+
+const CRON_TEST_CHANNEL_LABELS: Record<CronConfiguredChannelId, string> = {
+  feishu: "Feishu",
+  signal: "Signal",
+  telegram: "Telegram",
+};
+
+function createConfiguredCronChannelPlugin(id: CronConfiguredChannelId): ChannelPlugin {
+  return {
+    ...createChannelTestPluginBase({
+      id,
+      label: CRON_TEST_CHANNEL_LABELS[id],
+      config: {
+        listAccountIds: () => ["default"],
+        resolveAccount: () => ({}),
+        isConfigured: async () => true,
+      },
+    }),
+    outbound: createDirectOutboundTestAdapter({ channel: id }),
+  };
+}
+
+function installConfiguredCronChannels(ids: readonly CronConfiguredChannelId[]) {
+  setTestPluginRegistry(
+    createTestRegistry(
+      ids.map((id) => ({
+        pluginId: id,
+        source: "test",
+        plugin: createConfiguredCronChannelPlugin(id),
+      })),
+    ),
+  );
 }
 
 async function runCronJobForce(ws: WebSocket, id: string) {
@@ -644,6 +697,7 @@ describe("gateway server cron", () => {
       sessionConfig: { mainKey: "primary" },
       cronEnabled: false,
     });
+    installConfiguredCronChannels(["telegram"]);
 
     const cronState = await createDirectCronState();
 
@@ -707,6 +761,9 @@ describe("gateway server cron", () => {
           delivery: { mode: "announce", channel: "telegram", to: "19098680" },
         },
       });
+      if (!mergeUpdateRes.ok) {
+        throw new Error(mergeUpdateRes.error?.message ?? "cron.update failed");
+      }
       expect(mergeUpdateRes.ok).toBe(true);
       const merged = mergeUpdateRes.payload as
         | {
@@ -805,6 +862,7 @@ describe("gateway server cron", () => {
       expect(replaced?.payload?.message).toBe("hello");
       expect(replaced?.payload?.model).toBeUndefined();
 
+      installConfiguredCronChannels(["signal", "telegram"]);
       const deliveryPatchRes = await directCronReq(cronState, "cron.update", {
         id: mergeJobId,
         patch: {
@@ -1465,6 +1523,7 @@ describe("gateway server cron", () => {
         webhookToken: "cron-webhook-token",
       },
     });
+    installConfiguredCronChannels(["telegram"]);
 
     fetchWithSsrFGuardMock.mockClear();
 
@@ -1682,6 +1741,7 @@ describe("gateway server cron", () => {
       tempPrefix: "openclaw-gw-cron-failure-session-target-",
       cronEnabled: false,
     });
+    installConfiguredCronChannels(["feishu"]);
 
     const { server, ws } = await startServerWithClient();
     await connectOk(ws);
